@@ -556,5 +556,103 @@ else
     echo -e "Pointer cast test passed"
 fi
 
+
+
+echo -e "Structure access with pointers and array test"
+./build/pointer_cast_test
+if [ $? -ne 50 ]; then
+    echo -e "Structure access with pointers and array test failed"
+    res_code=1
+else
+    echo -e "Structure access with pointers and array test passed"
+fi
+
+echo -e "Pointer addition test"
+./build/pointer_addition_test
+if [ $? -ne 20 ]; then
+    echo -e "Pointer addition test failed"
+    res_code=1
+else
+    echo -e "Pointer addition test passed"
+fi
+echo -e "Array get pointer test"
+./build/array_get_pointer_test
+if [ $? -ne 20 ]; then
+    echo -e "Array get pointer test failed"
+    res_code=1
+else
+    echo -e "Array get pointer test passed"
+fi
+
+echo -e "Logical Operator Test"
+./build/logical_operator_test
+if [ $? -ne 1 ]; then
+    echo -e "Logical operator test failed"
+    res_code=1
+else
+    echo -e "Logical operator test passed"
+fi
+
+
+echo -e "Decrement Operator Test"
+./build/decrement_operator_test
+if [ $? -ne 0 ]; then
+    echo -e "Decrement operator test failed"
+    res_code=1
+else
+    echo -e "Decrement operator test passed"
+fi
+
+
+echo -e "Const Char pointer Test"
+./build/const_char_pointer_test
+if [ $? -ne 104 ]; then
+    echo -e "Const Char pointer test failed"
+    res_code=1
+else
+    echo -e "Const Char pointer test passed"
+fi
+
+echo -e "Macro string test Test"
+./build/preprocessor_macro_string_test
+if [ $? -ne 1 ]; then
+    echo -e "Macro string test failed"
+    res_code=1
+else
+    echo -e "Macro string test passed"
+fi
+
+
+echo -e "Logical not test "
+./build/logical_not_test
+if [ $? -ne 1 ]; then
+    echo -e "Logical not test failed"
+    res_code=1
+else
+    echo -e "Logical not test passed"
+fi
+
+
+echo -e "Offset Of test "
+./build/offsetof_test
+if [ $? -ne 150 ]; then
+    echo -e "Offsetof test failed"
+    res_code=1
+else
+    echo -e "Offsetof test passed"
+fi
+
+
+echo -e "Valist test "
+./build/valist_test
+if [ $? -ne 100 ]; then
+    echo -e "Valist test failed"
+    res_code=1
+else
+    echo -e "Valist test passed"
+fi
+
+
+
 echo -e "All tests finished"
 exit $res_code

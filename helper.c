@@ -308,8 +308,15 @@ struct node *struct_for_access(struct resolver_process *process, struct node *no
 }
 
 
-bool datatype_is_void_no_ptr(struct datatype* dtype)
-{   
+void datatype_set_void(struct datatype* dtype)
+{
+    dtype->type_str = "void";
+    dtype->type = DATA_TYPE_VOID;
+    dtype->size = 0;
+}
+
+bool datatype_is_void_no_ptr(struct datatype *dtype)
+{
     return S_EQ(dtype->type_str, "void") && !(dtype->flags & DATATYPE_FLAG_IS_POINTER);
 }
 
@@ -683,6 +690,19 @@ bool variable_node_is_primative(struct node *node)
     return datatype_is_primitive(&node->var.type);
 }
 
+struct datatype *datatype_pointer_reduce(struct datatype *datatype, int by)
+{
+    struct datatype *new_datatype = calloc(1, sizeof(struct datatype));
+    memcpy(new_datatype, datatype, sizeof(struct datatype));
+    new_datatype->pointer_depth -= by;
+    if (new_datatype->pointer_depth <= 0)
+    {
+        new_datatype->flags &= ~DATATYPE_FLAG_IS_POINTER;
+        new_datatype->pointer_depth = 0;
+    }
+    return new_datatype;
+}
+
 size_t datatype_size_no_ptr(struct datatype *datatype)
 {
     if (datatype->flags & DATATYPE_FLAG_IS_ARRAY)
@@ -690,9 +710,119 @@ size_t datatype_size_no_ptr(struct datatype *datatype)
     return datatype->size;
 }
 
+size_t datatype_size_for_array_access(struct datatype *datatype)
+{
+    if (datatype_is_struct_or_union(datatype) && datatype->flags & DATATYPE_FLAG_IS_POINTER && datatype->pointer_depth == 1)
+    {
+        // We have something like this struct dog* abc; abc[1]
+        // We should return the datatype size even though its a pointer.
+        return datatype->size;
+    }
+
+    return datatype_size(datatype);
+}
+
+off_t datatype_offset_for_identifier(struct compile_process* compiler, struct datatype* struct_union_datatype, struct node* identifier_node, struct datatype* datatype_out, off_t current_offset)
+{
+    assert(datatype_is_struct_or_union(struct_union_datatype));
+    assert(identifier_node->type == NODE_TYPE_IDENTIFIER);
+    off_t offset = current_offset;
+    struct symbol* sym = symresolver_get_symbol(compiler, struct_union_datatype->type_str);
+    assert(sym);
+    assert(sym->type == SYMBOL_TYPE_NODE);
+    struct node* symbol_node = sym->data;
+    assert(node_is_struct_or_union(symbol_node));
+
+    // Okay we have the structure/union _struct can be used since the substructures are the same
+    struct node* body_node = symbol_node->_struct.body_n;
+    vector_set_peek_pointer(body_node->body.statements, 0);
+    struct node* statement_node = vector_peek_ptr(body_node->body.statements);
+    while(statement_node)
+    {
+        if (statement_node->type == NODE_TYPE_VARIABLE)
+        {
+            if (S_EQ(statement_node->var.name, identifier_node->sval))
+            {
+                if (datatype_out)
+                {
+                    *datatype_out = statement_node->var.type;
+                }
+                break;
+            }
+            offset += variable_size(statement_node);
+        }
+
+        statement_node = vector_peek_ptr(body_node->body.statements);
+    }
+
+    return offset;
+}
+
+off_t _datatype_offset(struct compile_process* compiler, off_t current_offset, struct datatype* struct_union_datatype, struct node* member_node, struct datatype* datatype_out);
+
+off_t datatype_offset_for_expression(struct compile_process* compiler, struct datatype* struct_union_datatype, struct node* expression_node, off_t current_offset, struct datatype* datatype_out)
+{
+    off_t offset = current_offset;
+    assert(datatype_is_struct_or_union(struct_union_datatype));
+    assert(expression_node->type == NODE_TYPE_EXPRESSION);
+    struct node* left_node = expression_node->exp.left;
+    struct node* right_node = expression_node->exp.right;
+    struct datatype left_datatype = {0};
+
+    offset = _datatype_offset(compiler, offset, struct_union_datatype, left_node, &left_datatype);
+    assert(datatype_is_struct_or_union(&left_datatype));
+
+    // Change the structure union datatype to the left type
+    offset = _datatype_offset(compiler, offset, &left_datatype, right_node, datatype_out);
+    return offset;
+}
+off_t _datatype_offset(struct compile_process* compiler, off_t current_offset, struct datatype* struct_union_datatype, struct node* member_node,  struct datatype* datatype_out)
+{
+    assert(datatype_is_struct_or_union(struct_union_datatype));
+    off_t offset = current_offset;
+    switch(member_node->type)
+    {
+        case NODE_TYPE_EXPRESSION:
+            offset = datatype_offset_for_expression(compiler, struct_union_datatype, member_node, offset, datatype_out);
+
+        break;
+
+        case NODE_TYPE_EXPRESSION_PARENTHESIS:
+            compiler_error(compiler, "Parenthesis is not allowed in a structure/union member offsetof expression");
+        break;
+
+        case NODE_TYPE_IDENTIFIER:
+           offset = datatype_offset_for_identifier(compiler, struct_union_datatype, member_node, datatype_out, offset);
+        break;
+    }
+
+    return offset;
+}
+off_t datatype_offset(struct compile_process* compiler, struct datatype* datatype, struct node* member_node)
+{
+    off_t offset = 0;
+
+    // We can only make offsets from within structures, if a non structure
+    // is provided then return zero
+    if (!datatype_is_struct_or_union(datatype))
+    {
+       return 0;
+    }
+
+    struct datatype datatype_of_member = {0};
+    offset =_datatype_offset(compiler, 0, datatype, member_node, &datatype_of_member);
+    
+    off_t aligned_offset = offset;
+    if (datatype_size(&datatype_of_member) > 0)
+    {
+        aligned_offset = align_value(offset, datatype_size(&datatype_of_member));
+    }
+    return aligned_offset;
+}
+
 size_t datatype_size(struct datatype *datatype)
 {
-    if (datatype->flags & DATATYPE_FLAG_IS_POINTER)
+    if (datatype->flags & DATATYPE_FLAG_IS_POINTER && datatype->pointer_depth > 0)
         return DATA_SIZE_DWORD;
 
     if (datatype->flags & DATATYPE_FLAG_IS_ARRAY)
@@ -716,10 +846,25 @@ size_t datatype_element_size(struct datatype *datatype)
 struct datatype datatype_for_numeric()
 {
     struct datatype dtype = {};
+    dtype.flags |= DATATYPE_FLAG_IS_LITERAL;
     dtype.type = DATA_TYPE_INTEGER;
     dtype.type_str = "int";
     dtype.size = DATA_SIZE_DWORD;
     return dtype;
+}
+
+struct datatype *datatype_thats_a_pointer(struct datatype *d1, struct datatype *d2)
+{
+    if (d1->flags & DATATYPE_FLAG_IS_POINTER)
+    {
+        return d1;
+    }
+    else if (d2->flags & DATATYPE_FLAG_IS_POINTER)
+    {
+        return d2;
+    }
+
+    return NULL;
 }
 
 /**
@@ -732,12 +877,11 @@ struct datatype datatype_for_string()
     struct datatype dtype = {};
     dtype.type = DATA_TYPE_INTEGER;
     dtype.type_str = "char";
-    dtype.flags |= DATATYPE_FLAG_IS_POINTER;
+    dtype.flags |= DATATYPE_FLAG_IS_POINTER | DATATYPE_FLAG_IS_LITERAL;
     dtype.pointer_depth = 1;
     dtype.size = DATA_SIZE_DWORD;
     return dtype;
 }
-
 
 size_t variable_size(struct node *var_node)
 {

@@ -30,6 +30,7 @@ static struct lex_process *lex_process;
 
 const char *read_number_str();
 unsigned long long read_number();
+static struct token *lexer_last_token();
 
 void error(const char *fmt, ...)
 {
@@ -47,6 +48,16 @@ void lex_new_expression()
         // This is the first expression in series? Then we must initialize the buffer
         lex_process->parentheses_buffer = buffer_create();
     }
+
+    // If the last token is a comma or identifier then this is a new argument string buffer.
+    struct token* last_token = lexer_last_token();
+    if (last_token && (last_token->type == TOKEN_TYPE_IDENTIFIER || token_is_operator(last_token, ",")))
+    {
+        // The last token was an identifier.. This means this is some sort of function call i.e
+        //ABC(
+        // Where we are at the left bracket.
+        lex_process->argument_string_buffer = buffer_create();
+    }
 }
 
 void lex_finish_expression()
@@ -56,6 +67,7 @@ void lex_finish_expression()
     {
         error("You closed an expression before opening one");
     }
+    
 }
 
 bool lex_is_in_expression()
@@ -91,6 +103,10 @@ static char nextc()
     if (lex_is_in_expression())
     {
         buffer_write(lex_process->parentheses_buffer, c);
+        if (lex_process->argument_string_buffer)
+        {
+            buffer_write(lex_process->argument_string_buffer, c);
+        }
     }
     lex_process->pos.col++;
     if (c == '\n')
@@ -198,6 +214,8 @@ static bool op_valid(const char *op)
            S_EQ(op, "+=") ||
            S_EQ(op, "-=") ||
            S_EQ(op, "*=") ||
+           S_EQ(op, ">>=") ||
+           S_EQ(op, "<<=") ||
            S_EQ(op, "/=") ||
            S_EQ(op, ">>") ||
            S_EQ(op, "<<") ||
@@ -212,7 +230,6 @@ static bool op_valid(const char *op)
            S_EQ(op, "++") ||
            S_EQ(op, "--") ||
            S_EQ(op, "=") ||
-           S_EQ(op, "/=") ||
            S_EQ(op, "*=") ||
            S_EQ(op, "^=") ||
            S_EQ(op, "==") ||
@@ -225,7 +242,8 @@ static bool op_valid(const char *op)
            S_EQ(op, ".") ||
            S_EQ(op, "...") ||
            S_EQ(op, "~") ||
-           S_EQ(op, "?");
+           S_EQ(op, "?") ||
+           S_EQ(op, "%");
 }
 
 static struct lex_process *lex_get_process()
@@ -264,7 +282,13 @@ static struct token *token_create(struct token *_token)
     tmp_token.pos = lex_file_position();
     if (lex_is_in_expression())
     {
+        assert(lex_process->parentheses_buffer);
         tmp_token.between_brackets = buffer_ptr(lex_process->parentheses_buffer);
+        
+        if (lex_process->argument_string_buffer)
+        {
+            tmp_token.between_arguments = buffer_ptr(lex_process->argument_string_buffer);
+        }
     }
     return &tmp_token;
 }
@@ -279,15 +303,8 @@ static void lex_handle_escape_number(struct buffer *buf)
     buffer_write(buf, number);
 }
 
-static void lex_handle_escape(struct buffer *buf)
+char lex_get_escaped_char(char c)
 {
-    char c = peekc();
-    if (isdigit(c))
-    {
-        // We have a number?
-        lex_handle_escape_number(buf);
-        return;
-    }
 
     char co = 0x00;
     switch (c)
@@ -302,9 +319,27 @@ static void lex_handle_escape(struct buffer *buf)
     case 't':
         co = '\t';
     break;
+
+    case '\'':
+        co = '\'';
+    break;
+
     default:
         error("Unknown escape token %c\n", c);
     }
+    return co;
+}
+static void lex_handle_escape(struct buffer *buf)
+{
+    char c = peekc();
+    if (isdigit(c))
+    {
+        // We have a number?
+        lex_handle_escape_number(buf);
+        return;
+    }
+
+    char co = lex_get_escaped_char(c);
 
     buffer_write(buf, co);
     // Pop off the char
@@ -372,15 +407,26 @@ static const char *read_op()
     struct buffer *buffer = buffer_create();
     buffer_write(buffer, op);
 
-    if (!op_treated_as_one(op))
+    if (op == '*' && peekc() == '=')
     {
-        op = peekc();
-        if (is_single_operator(op))
+        // This is *= so even though its treated as one operator, in this case its two.
+        buffer_write(buffer, peekc());
+        // Skip the "=" we just wrote it.
+        nextc();
+    }
+    else if (!op_treated_as_one(op))
+    {
+        for (int i = 0; i < 2; i++)
         {
-            buffer_write(buffer, op);
-            nextc();
-            single_operator = false;
+            op = peekc();
+            if (is_single_operator(op))
+            {
+                buffer_write(buffer, op);
+                nextc();
+                single_operator = false;
+            }
         }
+
     }
 
     char *ptr = buffer_ptr(buffer);
@@ -622,11 +668,12 @@ static struct token *token_make_quote()
     char c = nextc();
     if (c == '\\')
     {
-        // We have an escape here.. For now we shall ignore it. This must be handled
-        // in the future!
+        // We have an escape here.
         c = nextc();
+        c = lex_get_escaped_char(c);
     }
 
+    assert_next_char('\'');
     // Characters are basically just small numbers. Treat it as such.
     return token_create(&(struct token){TOKEN_TYPE_NUMBER, .cval = c});
 }
@@ -744,7 +791,6 @@ static struct token *read_next_token()
     case '"':
         token = token_make_string('"', '"');
         break;
-
     case '\n':
         token = token_make_newline();
         break;
@@ -773,7 +819,7 @@ int lex(struct lex_process *process)
 {
     process->current_expression_count = 0;
     process->parentheses_buffer = NULL;
-
+    process->argument_string_buffer = NULL;
     lex_process = process;
     // Copy filename to the lex process
     lex_process->pos.filename = process->compiler->cfile.abs_path;

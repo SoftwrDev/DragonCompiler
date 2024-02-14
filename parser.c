@@ -83,13 +83,13 @@ struct op_precedence_group
 };
 
 /**
- * Format: 
+ * Format:
  * {operator1, operator2, operator3, NULL}
- * 
+ *
  * end each group with NULL.
- * 
+ *
  * Also end the collection of groups with a NULL pointer
- * 
+ *
  * Found in expressionable.c
  */
 extern struct op_precedence_group op_precedence[TOTAL_OPERATOR_GROUPS];
@@ -164,7 +164,6 @@ static struct history *history_begin(struct history *history_out, int flags)
 
 #define parser_scope_current() \
     scope_current(current_process)
-
 
 int size_of_struct(const char *struct_name);
 void parse_variable(struct datatype *dtype, struct token *name_token, struct history *history);
@@ -570,8 +569,8 @@ void make_variable_node(struct datatype *datatype, struct token *name_token, str
     if (var_node->var.type.type == DATA_TYPE_STRUCT && !var_node->var.type.struct_node)
     {
         struct datatype_struct_node_fix_private *private = calloc(sizeof(struct datatype_struct_node_fix_private), 1);
-    private
-        ->node = var_node;
+        private
+            ->node = var_node;
         fixup_register(parser_fixup_sys, &(struct fixup_config){.fix = datatype_struct_node_fix, .end = datatype_struct_node_fix_end, .private = private});
     }
 }
@@ -782,7 +781,7 @@ void parse_body_multiple_statements(size_t *variable_size, struct vector *body_v
  * Parses the body and stores the collective variable size in the "variable_size" variable
  * This can be useful for parsing a structures body and having the size returned of the
  * combined variables.
- * 
+ *
  * Note the size will not be 16-bit aligned as required in the C standard.
  */
 void parse_body(size_t *variable_size, struct history *history)
@@ -825,7 +824,7 @@ void parse_body(size_t *variable_size, struct history *history)
 
 /**
  * Shifts the children of the node to the left.
- * 
+ *
  * I.e 50*E(20+120) will become E(50*20)+120
  */
 void parser_node_shift_children_left(struct node *node)
@@ -868,7 +867,7 @@ void parser_node_flip_children(struct node *node)
 }
 
 /**
- * Reorders the given expression and its children, based on operator priority. I.e 
+ * Reorders the given expression and its children, based on operator priority. I.e
  * multiplication takes priority over addition.
  */
 void parser_reorder_expression(struct node **node_out)
@@ -909,7 +908,7 @@ void parser_reorder_expression(struct node **node_out)
 
     // Should optimize the priority array rather than statics
     // Todo...
-    if ((is_array_node(node->exp.left) && is_node_assignment(node->exp.right)) || (node_is_expression(node->exp.left, "()") &&
+    if ((is_array_node(node->exp.left) && is_node_assignment(node->exp.right)) || ((node_is_expression(node->exp.left, "()") || node_is_expression(node->exp.left, "[]")) &&
                                                                                    node_is_expression(node->exp.right, ",")))
     {
         // We have a comma here and an expression to the left, therefore left operand
@@ -933,7 +932,7 @@ void parse_for_indirection_unary()
     parse_expressionable(history_begin(&history, EXPRESSION_IS_UNARY));
 
     struct node *unary_operand_node = node_pop();
-    make_unary_node("*", unary_operand_node);
+    make_unary_node("*", unary_operand_node, 0);
 
     struct node *unary_node = node_pop();
     unary_node->unary.indirection.depth = depth;
@@ -961,7 +960,7 @@ void parse_for_normal_unary()
     struct history history;
     parse_expressionable(history_begin(&history, EXPRESSION_IS_UNARY));
     struct node *unary_operand_node = node_pop();
-    make_unary_node(unary_op, unary_operand_node);
+    make_unary_node(unary_op, unary_operand_node, 0);
 }
 
 void parser_deal_with_additional_expression()
@@ -1153,6 +1152,7 @@ void parse_sizeof(struct history *history)
     // Get rid of the sizeof
     expect_keyword("sizeof");
     expect_op("(");
+    
     // Now for our expression
     struct datatype dtype;
     parse_datatype(&dtype);
@@ -1396,7 +1396,7 @@ void parse_keyword(struct history *history)
         parse_sizeof(history);
         return;
     }
-
+ 
     // keyword_is_datatype is temporary because custom types can exist
     // Therefore variable declarations will be the appropaite action
     // if all other keywords are not present.
@@ -1466,10 +1466,16 @@ void parse_keyword(struct history *history)
     parse_err("Unexpected keyword %s\n", token->sval);
 }
 
+void parse_for_right_operanded_unary(struct node *left_operand_node, const char *unary_op)
+{
+    make_unary_node(unary_op, left_operand_node, UNARY_FLAG_IS_RIGHT_OPERANDED_UNARY);
+}
+
 void parse_exp_normal(struct history *history)
 {
     struct token *op_token = token_peek_next();
     const char *op = op_token->sval;
+
     // We must pop the last node as this will be the left operand
     struct node *node_left = node_peek_expressionable_or_null();
     if (!node_left)
@@ -1490,6 +1496,12 @@ void parse_exp_normal(struct history *history)
     token_next();
     // Pop left node
     node_pop();
+
+    if (is_right_operanded_unary_operator(op))
+    {
+        parse_for_right_operanded_unary(node_left, op);
+        return;
+    }
     // Left node is now apart of an expression
     node_left->flags |= NODE_FLAG_INSIDE_EXPRESSION;
 
@@ -1706,11 +1718,37 @@ struct node *parser_evaluate_exp_to_numerical_node(struct node *node)
 struct node *parser_evaluate_identifier_to_numerical_node(struct node *node)
 {
     assert(node->type == NODE_TYPE_IDENTIFIER);
-    if (node_is_constant(current_process->resolver, node))
+
+    struct resolver_result *result = resolver_follow(current_process->resolver, node);
+    if (!resolver_result_ok(result))
     {
-        long val = node_pull_literal(current_process->resolver, node);
-        node_create(&(struct node){.type = NODE_TYPE_NUMBER, .llnum = val});
-        return node_pop();
+        return node;
+    }
+
+    struct resolver_entity *entity = NULL;
+    entity = resolver_result_entity(result);
+    struct variable *var = NULL;
+
+    if (entity && entity->node)
+    {
+        struct node* var_node = variable_node(entity->node);
+        if (var_node)
+        {
+            var = &var_node->var;
+        }
+    }
+    // Only if the constant is not a pointer will we pull a literal and push a number node
+    // this is to prevent const char* ptr being interpreted as a literal number.
+    if (var && var->type.flags & DATATYPE_FLAG_IS_CONST && !(var->type.flags & DATATYPE_FLAG_IS_POINTER))
+    {
+        // Okay its constant
+        long literal_val = var->val->llnum;
+        if (node_is_constant(current_process->resolver, node) && !(node->flags & DATATYPE_FLAG_IS_POINTER))
+        {
+            long val = node_pull_literal(current_process->resolver, node);
+            node_create(&(struct node){.type = NODE_TYPE_NUMBER, .llnum = literal_val});
+            return node_pop();
+        }
     }
 
     return node;
@@ -1739,7 +1777,7 @@ struct node *parser_exp_parenthesis_const_to_literal(struct node *node)
 
 /**
  * Convert all constant expressions to a single numerical node
- * 
+ *
  * \return Returns the resulting node.
  */
 struct node *parser_const_to_literal(struct node *node)
@@ -1765,8 +1803,8 @@ struct node *parser_const_to_literal(struct node *node)
 void parse_expressionable_root(struct history *history)
 {
     parse_expressionable(history);
-    struct node *result_node = parser_const_to_literal(node_pop());
-    node_push(result_node);
+    //struct node *result_node = parser_const_to_literal(node_pop());
+   // node_push(result_node);
 }
 
 void parse_expressionable(struct history *history)
@@ -2038,6 +2076,12 @@ void parser_datatype_init(struct token *datatype_token, struct token *datatype_s
 {
     parser_datatype_init_type_and_size(datatype_token, datatype_secondary_token, datatype_out, pointer_depth, expected_type);
     datatype_out->type_str = datatype_token->sval;
+
+    if (S_EQ(datatype_token->sval, "long") && datatype_secondary_token && S_EQ(datatype_secondary_token->sval, "long"))
+    {
+        compiler_warning(current_process, "Our compiler does not support 64 bit long long so it will be treated as a 32 bit type not 64 bit\n");
+        datatype_out->size = DATA_SIZE_DWORD;
+    }
 }
 
 int parser_datatype_expected_for_type_string(const char *s)
@@ -2068,9 +2112,7 @@ void parser_get_datatype_tokens(struct token **datatype_token_out, struct token 
 }
 /**
  * Parses the type part of the datatype. I.e "int", "long"
- * 
- * "long long", "int long" ect ect will need to be implemented but for now
- * we support only one datatype for a series of tokens.
+ *
  */
 void parse_datatype_type(struct datatype *datatype)
 {
@@ -2169,7 +2211,7 @@ void parse_variable(struct datatype *dtype, struct token *name_token, struct his
 }
 
 /**
- * Unlike the "parse_variable" function this function does not expect you 
+ * Unlike the "parse_variable" function this function does not expect you
  * to know the datatype or the name of the variable, it parses that for you
  */
 void parse_variable_full(struct history *history)
@@ -2317,7 +2359,7 @@ bool parser_is_int_valid_after_datatype(struct datatype *dtype)
 
 /**
  * C allows you to abbrevative a datatype.
- * 
+ *
  * i.e long and long int are the same
  * Let's ignore the int if present
  */
@@ -2609,10 +2651,10 @@ void parser_get_all_nodes_of_type_single(struct vector *vector, struct node **no
  * Returns a pointer of all the nodes parsed in the parser that are of a given type.
  * iterates through all the child nodes not just the root of the tree. Points to the address
  * of their location on the stack
- * 
+ *
  * If you ask for nodes of variable types every variable node will be returned in the
  * entire parse process
- * 
+ *
  * \param ignore_childtypes_for_type If this is true then when a given node type is found it will not look for children in that node.
  */
 struct vector *parser_get_all_nodes_of_type(struct compile_process *process, int type, bool ignore_childtypes_for_type)

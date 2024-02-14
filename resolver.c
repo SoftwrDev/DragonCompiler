@@ -203,7 +203,7 @@ struct resolver_process *resolver_new_process(struct compile_process *compiler, 
 
 bool resolver_entity_has_array_multiplier(struct resolver_entity *entity)
 {
-    //return entity->var_data.array_runtime.multiplier > 1;
+    // return entity->var_data.array_runtime.multiplier > 1;
 }
 
 struct resolver_entity *resolver_create_new_entity(struct resolver_result *result, int type, void *private)
@@ -314,7 +314,11 @@ struct resolver_entity *resolver_create_new_unary_get_address_entity(struct reso
     // c - &
     entity->flags = RESOLVER_ENTITY_FLAG_NO_MERGE_WITH_NEXT_ENTITY | RESOLVER_ENTITY_FLAG_NO_MERGE_WITH_LEFT_ENTITY;
     entity->node = node;
+    entity->scope = scope;
 
+    entity->dtype = *dtype;
+    entity->dtype.flags |= DATATYPE_FLAG_IS_POINTER;
+    entity->dtype.pointer_depth++;
     return entity;
 }
 
@@ -415,6 +419,7 @@ struct resolver_entity *resolver_create_new_entity_for_function_call(struct reso
         return NULL;
     }
     entity->dtype = left_operand_entity->dtype;
+    entity->name = left_operand_entity->name;
     entity->func_call_data.arguments = vector_create(sizeof(struct node *));
     return entity;
 }
@@ -428,6 +433,24 @@ struct resolver_entity *resolver_register_function(struct resolver_process *proc
     entity->name = func_node->func.name;
     entity->node = func_node;
     entity->dtype = func_node->func.rtype;
+    entity->scope = resolver_process_scope_current(process);
+    // Functions must be on the root most scope
+    vector_push(process->scope.root->entities, &entity);
+    return entity;
+}
+
+struct resolver_entity *resolver_create_new_entity_for_native_function(struct resolver_process *process, const char *name, struct symbol *native_func_symbol)
+{
+    struct resolver_entity *entity = resolver_create_new_entity(NULL, RESOLVER_ENTITY_TYPE_NATIVE_FUNCTION, NULL);
+    if (!entity)
+        return NULL;
+    entity->name = name;
+    // Void return type
+    datatype_set_void(&entity->dtype);
+    make_function_node(&entity->dtype, name, NULL, NULL); 
+    entity->node = node_pop();
+    entity->name = name;
+    entity->native_func.symbol = native_func_symbol;
     entity->scope = resolver_process_scope_current(process);
     // Functions must be on the root most scope
     vector_push(process->scope.root->entities, &entity);
@@ -529,7 +552,13 @@ struct resolver_entity *resolver_get_variable_from_local_scope(struct resolver_p
 
 struct resolver_entity *resolver_get_function_in_scope(struct resolver_result *result, struct resolver_process *resolver, const char *func_name, struct resolver_scope *scope)
 {
-    return resolver_get_entity_for_type(result, resolver, func_name, RESOLVER_ENTITY_TYPE_FUNCTION);
+    struct resolver_entity* entity =  resolver_get_entity_for_type(result, resolver, func_name, RESOLVER_ENTITY_TYPE_FUNCTION);
+    if (!entity)
+    {
+        entity =  resolver_get_entity_for_type(result, resolver, func_name, RESOLVER_ENTITY_TYPE_NATIVE_FUNCTION);
+    
+    }
+    return entity;
 }
 
 struct resolver_entity *resolver_get_function(struct resolver_result *result, struct resolver_process *resolver, const char *func_name)
@@ -544,6 +573,12 @@ struct resolver_entity *resolver_get_function(struct resolver_result *result, st
 
 static void resolver_follow_part(struct resolver_process *resolver, struct node *node, struct resolver_result *result);
 
+bool resolver_do_indirection(struct resolver_entity *entity)
+{
+    struct resolver_result *result = entity->result;
+    return entity->type != RESOLVER_ENTITY_TYPE_FUNCTION_CALL && !(result->flags & RESOLVER_RESULT_FLAG_DOES_GET_ADDRESS) && entity->type != RESOLVER_ENTITY_TYPE_CAST;
+}
+
 static struct resolver_entity *resolver_follow_struct_exp(struct resolver_process *resolver, struct node *node, struct resolver_result *result)
 {
     struct resolver_entity *result_entity = NULL;
@@ -556,7 +591,8 @@ static struct resolver_entity *resolver_follow_struct_exp(struct resolver_proces
         rule.left.flags = RESOLVER_ENTITY_FLAG_NO_MERGE_WITH_NEXT_ENTITY;
 
         // Function calls return addresses of structures, no need for indirection
-        if (left_entity->type != RESOLVER_ENTITY_TYPE_FUNCTION_CALL)
+        // Obviously theirs no indirection if we are getting the address as we dont want to peek into the next pointer in this regard.
+        if (resolver_do_indirection(left_entity))
         {
             rule.right.flags = RESOLVER_ENTITY_FLAG_DO_INDIRECTION;
         }
@@ -613,10 +649,20 @@ static struct resolver_entity *resolver_follow_array_bracket(struct resolver_pro
     {
         index = last_entity->array.index + 1;
     }
+
+    // It is not always an array maybe its a pointer?
+    if (dtype.flags & DATATYPE_FLAG_IS_ARRAY)
+    {
+        // We must readjust the datatype size because we have accessed a deeper part of the array
+        dtype.array.size = array_brackets_calculate_size_from_index(&dtype, dtype.array.brackets, index + 1);
+    }
+    // We must reduce the dtype
     void *private = resolver->callbacks.new_array_entity(result, node);
     struct resolver_entity *array_bracket_entity = resolver_create_new_entity_for_array_bracket(result, resolver, node, node->bracket.inner, index, &dtype, private, scope);
     struct resolver_entity_rule rule = {};
     resolver_array_bracket_set_flags(array_bracket_entity, &dtype, node, index);
+    // Last entity uses an array bracket
+    last_entity->flags |= RESOLVER_ENTITY_FLAG_USES_ARRAY_BRACKETS;
 
     if (array_bracket_entity->flags & RESOLVER_ENTITY_FLAG_IS_POINTER_ARRAY_ENTITY)
     {
@@ -663,7 +709,7 @@ static void resolver_build_function_call_arguments(struct resolver_process *reso
         if (dtype)
         {
             // It will use 4 bytes on the stack unless its a structure
-            stack_change = datatype_size(dtype);
+            stack_change = datatype_element_size(dtype);
             if (stack_change < DATA_SIZE_DWORD)
             {
                 stack_change = DATA_SIZE_DWORD;
@@ -682,7 +728,6 @@ static struct resolver_entity *resolver_follow_function_call(struct resolver_pro
     resolver_follow_part(resolver, node->exp.left, result);
 
     struct resolver_entity *left_entity = resolver_result_peek(result);
-
     // As this is a function all we must create a new function call entity, for this given function call
     struct resolver_entity *func_call_entity = resolver_create_new_entity_for_function_call(result, resolver, left_entity, NULL);
     assert(func_call_entity);
@@ -691,7 +736,7 @@ static struct resolver_entity *resolver_follow_function_call(struct resolver_pro
     // Let's build the function call arguments
     resolver_build_function_call_arguments(resolver, node->exp.right, func_call_entity, &func_call_entity->func_call_data.stack_size);
 
-    //Push the function call entity to the stack
+    // Push the function call entity to the stack
     resolver_result_entity_push(result, func_call_entity);
 
     return func_call_entity;
@@ -754,6 +799,17 @@ struct resolver_entity *resolver_follow_for_name(struct resolver_process *resolv
 struct resolver_entity *resolver_follow_identifier(struct resolver_process *resolver, struct node *node, struct resolver_result *result)
 {
     struct resolver_entity *entity = resolver_follow_for_name(resolver, node->sval, result);
+    if (!entity)
+    {
+        // No entity? Is it a native function maybe
+        struct symbol *symbol = symresolver_get_symbol_for_native_function(resolver->compiler, node->sval);
+        if (symbol)
+        {
+            // Yep it is great
+            entity = resolver_create_new_entity_for_native_function(resolver, symbol->name, symbol);
+            resolver_result_entity_push(result, entity);
+        }
+    }
     if (entity)
     {
         entity->last_resolve.referencing_node = node;
@@ -791,6 +847,8 @@ struct resolver_entity *resolver_follow_indirection(struct resolver_process *res
 }
 struct resolver_entity *resolver_follow_unary_address(struct resolver_process *resolver, struct node *node, struct resolver_result *result)
 {
+    result->flags |= RESOLVER_RESULT_FLAG_DOES_GET_ADDRESS;
+
     // Okay this is an address unary i.e &a.b.c;
     resolver_follow_part(resolver, node->unary.operand, result);
 
@@ -835,6 +893,14 @@ struct resolver_entity *resolver_follow_cast(struct resolver_process *resolver, 
     operand_entity->flags |= RESOLVER_ENTITY_FLAG_WAS_CASTED;
 
     struct resolver_entity *cast_entity = resolver_create_new_cast_entity(resolver, operand_entity->scope, &node->cast.dtype);
+    if (datatype_is_struct_or_union(&node->cast.dtype))
+    {
+        if (!cast_entity->scope)
+        {
+            cast_entity->scope = resolver->scope.current;
+        }
+        result->last_struct_union_entity = cast_entity;
+    }
     resolver_result_entity_push(result, cast_entity);
     return cast_entity;
 }
@@ -1094,8 +1160,9 @@ void resolver_finalize_result_flags(struct resolver_process *resolver, struct re
     int flags = RESOLVER_RESULT_FLAG_FIRST_ENTITY_PUSH_VALUE;
     // We must iterate through all of the results
     struct resolver_entity *entity = result->entity;
+    struct resolver_entity *first_entity = entity;
     struct resolver_entity *last_entity = result->last_entity;
-
+    bool does_get_address = false;
     if (entity == last_entity)
     {
         // One entity?
@@ -1126,8 +1193,9 @@ void resolver_finalize_result_flags(struct resolver_process *resolver, struct re
 
         if (entity->type == RESOLVER_ENTITY_TYPE_UNARY_GET_ADDRESS)
         {
-            flags |= RESOLVER_RESULT_FLAG_FIRST_ENTITY_LOAD_TO_EBX;
+            flags |= RESOLVER_RESULT_FLAG_FIRST_ENTITY_LOAD_TO_EBX | RESOLVER_RESULT_FLAG_DOES_GET_ADDRESS;
             flags &= ~RESOLVER_RESULT_FLAG_FIRST_ENTITY_PUSH_VALUE | RESOLVER_RESULT_FLAG_FINAL_INDIRECTION_REQUIRED_FOR_VALUE;
+            does_get_address = true;
         }
 
         if (entity->type == RESOLVER_ENTITY_TYPE_FUNCTION_CALL)
@@ -1140,8 +1208,16 @@ void resolver_finalize_result_flags(struct resolver_process *resolver, struct re
 
         if (entity->type == RESOLVER_ENTITY_TYPE_ARRAY_BRACKET)
         {
-            flags |= RESOLVER_RESULT_FLAG_FIRST_ENTITY_LOAD_TO_EBX;
-            flags &= ~RESOLVER_RESULT_FLAG_FIRST_ENTITY_PUSH_VALUE;
+            if (entity->dtype.flags & DATATYPE_FLAG_IS_POINTER)
+            {
+                flags |= RESOLVER_RESULT_FLAG_FIRST_ENTITY_PUSH_VALUE;
+                flags &= ~RESOLVER_RESULT_FLAG_FIRST_ENTITY_LOAD_TO_EBX;
+            }
+            else
+            {
+                flags |= RESOLVER_RESULT_FLAG_FIRST_ENTITY_LOAD_TO_EBX;
+                flags &= ~RESOLVER_RESULT_FLAG_FIRST_ENTITY_PUSH_VALUE;
+            }
             if (entity->flags & RESOLVER_ENTITY_FLAG_IS_POINTER_ARRAY_ENTITY)
             {
                 flags |= RESOLVER_RESULT_FLAG_FINAL_INDIRECTION_REQUIRED_FOR_VALUE;
@@ -1157,11 +1233,24 @@ void resolver_finalize_result_flags(struct resolver_process *resolver, struct re
         entity = entity->next;
     }
 
-    if (last_entity->type == RESOLVER_ENTITY_TYPE_VARIABLE)
+    if (last_entity->dtype.flags & DATATYPE_FLAG_IS_ARRAY && (!does_get_address && last_entity->type == RESOLVER_ENTITY_TYPE_VARIABLE && !(last_entity->flags & RESOLVER_ENTITY_FLAG_USES_ARRAY_BRACKETS)))
+    {
+        // Here we need to deal with circumstances such as
+        // char abc[50]; char* p = abc; Without handling this senario abc[0] will go into the p variable
+        // rather than the address of abc.
+
+        flags &= ~RESOLVER_RESULT_FLAG_FINAL_INDIRECTION_REQUIRED_FOR_VALUE;
+    }
+    else if (last_entity->type == RESOLVER_ENTITY_TYPE_VARIABLE)
     {
         flags |= RESOLVER_RESULT_FLAG_FINAL_INDIRECTION_REQUIRED_FOR_VALUE;
     }
 
+    if (does_get_address)
+    {
+        // Getting address does not require indirection
+        flags &= ~RESOLVER_RESULT_FLAG_FINAL_INDIRECTION_REQUIRED_FOR_VALUE;
+    }
     result->flags |= flags;
 }
 void resolver_finalize_result(struct resolver_process *resolver, struct resolver_result *result)

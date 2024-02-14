@@ -1,7 +1,16 @@
+#include <stddef.h>
+#include <stdio.h>
+
+struct address {
+   char name[50];
+   char street[50];
+   int phone;
+};
+
 int main()
 {
-    int x;
-    x = 593821;
-    x = x << 1 & 2;
-    return x;
+   int kk;
+   kk = 50;
+   return 0;
 }
+ 

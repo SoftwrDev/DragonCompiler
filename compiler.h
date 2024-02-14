@@ -137,7 +137,8 @@ enum
     EXPRESSION_IS_UNARY = 0b1000000000000000000000000000,
     IS_STATEMENT_RETURN = 0b10000000000000000000000000000,
     IS_RIGHT_OPERAND_OF_ASSIGNMENT = 0b100000000000000000000000000000,
-    IS_LEFT_OPERAND_OF_ASSIGNMENT = 0b1000000000000000000000000000000
+    IS_LEFT_OPERAND_OF_ASSIGNMENT = 0b1000000000000000000000000000000,
+    EXPRESSION_IS_MODULAS = 0b10000000000000000000000000000000
 
 };
 
@@ -146,6 +147,7 @@ enum
     EXPRESSION_IS_SUBTRACTION |        \
     EXPRESSION_IS_MULTIPLICATION |     \
     EXPRESSION_IS_DIVISION |           \
+    EXPRESSION_IS_MODULAS |           \
     EXPRESSION_IN_FUNCTION_CALL |      \
     EXPRESSION_INDIRECTION |           \
     EXPRESSION_GET_ADDRESS |           \
@@ -166,11 +168,10 @@ enum
 
 #define EXPRESSION_UNINHERITABLE_FLAGS                                                               \
     (EXPRESSION_FLAG_RIGHT_NODE | EXPRESSION_IN_FUNCTION_CALL_ARGUMENTS |                            \
-     EXPRESSION_IS_ADDITION | EXPRESSION_IS_SUBTRACTION | EXPRESSION_IS_MULTIPLICATION |             \
+     EXPRESSION_IS_ADDITION | EXPRESSION_IS_MODULAS | EXPRESSION_IS_SUBTRACTION | EXPRESSION_IS_MULTIPLICATION |             \
      EXPRESSION_IS_DIVISION | EXPRESSION_IS_ABOVE | EXPRESSION_IS_ABOVE_OR_EQUAL |                   \
      EXPRESSION_IS_BELOW | EXPRESSION_IS_BELOW_OR_EQUAL | EXPRESSION_IS_EQUAL |                      \
-     EXPRESSION_IS_NOT_EQUAL | EXPRESSION_LOGICAL_AND |                                              \
-     EXPRESSION_IN_LOGICAL_EXPRESSION | EXPRESSION_IS_BITSHIFT_LEFT | EXPRESSION_IS_BITSHIFT_RIGHT | \
+     EXPRESSION_IS_NOT_EQUAL | EXPRESSION_LOGICAL_AND | EXPRESSION_IS_BITSHIFT_LEFT | EXPRESSION_IS_BITSHIFT_RIGHT | \
      EXPRESSION_IS_BITWISE_OR | EXPRESSION_IS_BITWISE_AND | EXPRESSION_IS_BITWISE_XOR | EXPRESSION_IS_ASSIGNMENT | IS_ALONE_STATEMENT)
 
 // Flags for structure access functions.
@@ -412,6 +413,9 @@ struct code_generator
     // This will allow a loop to restart.
     struct vector *entry_points;
 
+    // Vector of const char* that is put into the data section
+    struct vector* custom_data_section;
+    
     // Vector of struct response*
     struct vector *responses;
 };
@@ -452,6 +456,10 @@ struct lex_process
  */
     int current_expression_count;
     struct buffer *parentheses_buffer;
+
+    // Stores the entire string between function arguments or anything between commas
+    // for example ABC(hello world, testing). Would result in Hello world being in this buffer for tokens hello and world
+    struct buffer* argument_string_buffer;
 
     struct lex_process_functions *function;
 
@@ -562,7 +570,11 @@ struct datatype
     {
         struct array_brackets *brackets;
         // This datatype size for the full array its self.
-        // Calculation is datatype.size * EACH_INDEX.
+        // Calculation is datatype.size * EACH_INDEX
+        // Note the array size of a datatype can be changed depending on the expression it was involved in.
+        // for example int abc[50]; and then you go int x = abc[4]; the size will become 4 bytes because
+        // we have now resolved an integer. The original "abc" variable will maintain a datatype with a size
+        // of 50 * 4 
         size_t size;
     } array;
 };
@@ -606,13 +618,18 @@ enum
     RESOLVER_ENTITY_FLAG_IS_POINTER_ARRAY_ENTITY = 0b00100000,
     // This flag is set if the datatype of an entity
     // was changed due to a cast of some kind.
-    RESOLVER_ENTITY_FLAG_WAS_CASTED = 0b01000000
+    RESOLVER_ENTITY_FLAG_WAS_CASTED = 0b01000000,
+    // Gets set to the previous entity of an array bracket
+    // i.e abc[5] will cause the abc entity to have this flag, signifying it uses
+    // array brackets.
+    RESOLVER_ENTITY_FLAG_USES_ARRAY_BRACKETS = 0b10000000
 };
 
 enum
 {
     RESOLVER_ENTITY_TYPE_VARIABLE,
     RESOLVER_ENTITY_TYPE_FUNCTION,
+    RESOLVER_ENTITY_TYPE_NATIVE_FUNCTION,
     RESOLVER_ENTITY_TYPE_STRUCTURE,
     RESOLVER_ENTITY_TYPE_FUNCTION_CALL,
     RESOLVER_ENTITY_TYPE_ARRAY_BRACKET,
@@ -687,6 +704,11 @@ struct resolver_entity
             // for this function call.
             size_t stack_size;
         } func_call_data;
+
+        struct resolver_entity_native_function
+        {   
+            struct symbol* symbol;
+        } native_func;
 
         struct resolver_entity_rule
         {
@@ -804,7 +826,10 @@ enum
     RESOLVER_RESULT_FLAG_FIRST_ENTITY_PUSH_VALUE = 0b00100000,
 
     // Set if we must perform indirection to access the final value.
-    RESOLVER_RESULT_FLAG_FINAL_INDIRECTION_REQUIRED_FOR_VALUE = 0b01000000
+    RESOLVER_RESULT_FLAG_FINAL_INDIRECTION_REQUIRED_FOR_VALUE = 0b01000000,
+
+    // Are we getting the address i.e &a.b.c
+    RESOLVER_RESULT_FLAG_DOES_GET_ADDRESS = 0b10000000
 };
 
 /**
@@ -921,6 +946,9 @@ struct token
     // I.e if we have abc(50+20+40) then for numerical token 20 between_brackets
     // will point to the string 50+20+40
     const char *between_brackets;
+
+    // Holds the string between function arguments. IF any
+    const char* between_arguments;
 };
 
 struct sizeable_node
@@ -959,11 +987,11 @@ struct generator_entity_address
 
 typedef void (*ASM_PUSH_PROTOTYPE)(const char *ins, ...);
 
-// orinating_function is the function this function call originated from
-typedef void (*NATIVE_FUNCTION_CALL)(struct generator *generator, struct node *orinating_function, struct native_function *func, struct vector *arguments);
+typedef void (*NATIVE_FUNCTION_CALL)(struct generator *generator, struct native_function *func, struct vector *arguments);
 typedef void (*GENERATOR_GENERATE_EXPRESSION)(struct generator *generator, struct node *node, int flags);
 typedef void (*GENERATOR_ENTITY_ADDRESS)(struct generator *generator, struct resolver_entity *entity, struct generator_entity_address *address_out);
 typedef void (*GENERATOR_END_EXPRESSION)(struct generator *generator);
+typedef void (*GENERATOR_FUNCTION_RETURN)(struct datatype* dtype, const char* fmt, ...);
 
 struct generator
 {
@@ -971,6 +999,8 @@ struct generator
     GENERATOR_GENERATE_EXPRESSION gen_exp;
     GENERATOR_END_EXPRESSION end_exp;
     GENERATOR_ENTITY_ADDRESS entity_address;
+    GENERATOR_FUNCTION_RETURN ret;
+
     struct compile_process *compiler;
 
     // Private data for the generator.
@@ -988,6 +1018,8 @@ struct native_function
 };
 
 struct symbol *native_create_function(struct compile_process *compiler, const char *name, struct native_function_callbacks *callbacks);
+struct native_function* native_function_get(struct compile_process* compiler, const char* name);
+
 enum
 {
     PARSE_ALL_OK,
@@ -1019,6 +1051,7 @@ enum
     DATATYPE_FLAG_IGNORE_TYPE_CHECKING = 0b10000000,
     DATATYPE_FLAG_SECONDARY = 0b100000000,
     DATATYPE_FLAG_STRUCT_UNION_NO_NAME = 0b1000000000,
+    DATATYPE_FLAG_IS_LITERAL = 0b10000000000
 };
 
 enum
@@ -1153,9 +1186,14 @@ enum
     FUNCTION_NODE_FLAG_IS_NATIVE = 0b00000001
 };
 
+enum
+{
+    UNARY_FLAG_IS_RIGHT_OPERANDED_UNARY = 0b00000001
+};
 struct node;
 struct unary
 {
+    int flags;
     // In the case of indirection the "op" variable will only equal to one "*"
     // you can find the depth in the indirection structure within.
     const char *op;
@@ -1879,7 +1917,7 @@ void make_do_while_node(struct node *body_node, struct node *cond_node);
 void make_else_node(struct node *body_node);
 void make_union_node(const char *struct_name, struct node *body_node);
 void make_struct_node(const char *struct_name, struct node *body_node);
-void make_unary_node(const char *unary_op, struct node *operand_node);
+void make_unary_node(const char *unary_op, struct node *operand_node, int flags);
 void make_cast_node(struct datatype *dtype, struct node *operand_node);
 
 void make_return_node(struct node *exp_node);
@@ -1970,6 +2008,29 @@ int padding(int val, int to);
 
 bool datatype_is_void_no_ptr(struct datatype* dtype);
 
+
+/**
+ * Sets the datatype to void.
+*/
+void datatype_set_void(struct datatype* dtype);
+
+/**
+ * @brief Returns the datatype that is a pointer, if neither are pointer datatypes then NULL is returend
+ * 
+ * @param d1 The first datatype to check for a pointer
+ * @param d2 The second datatype to check for a pointer
+ * @return struct datatype* either d1 or d2 or NULL is returned.
+ */
+struct datatype* datatype_thats_a_pointer(struct datatype* d1, struct datatype* d2);
+/**
+ * @brief Reduces the datatype provided by x pointer size. The equivilant of doing *abc
+ * 
+ * @param datatype The datatype to reduce
+ * @param by The amount of depth to remove from the pointer
+ * @return struct datatype* returns a new copy of the datatype reduced.
+ */
+struct datatype* datatype_pointer_reduce(struct datatype* datatype, int by);
+
 bool datatype_is_primitive_for_string(const char *type);
 bool datatype_is_primitive(struct datatype *dtype);
 bool datatype_is_primitive_non_pointer(struct datatype *dtype);
@@ -2054,6 +2115,7 @@ struct array_brackets *array_brackets_new();
 void array_brackets_free(struct array_brackets *brackets);
 void array_brackets_add(struct array_brackets *brackets, struct node *bracket_node);
 size_t array_brackets_calculate_size(struct datatype *type, struct array_brackets *brackets);
+size_t array_brackets_calculate_size_from_index(struct datatype* type, struct array_brackets* brackets, int index);
 
 /**
  * Returns the full variable size for the given var_node. The full size in memory
@@ -2065,8 +2127,12 @@ size_t variable_size(struct node *var_node);
 size_t variable_size_for_list(struct node *var_list_node);
 
 size_t datatype_size(struct datatype *datatype);
+size_t datatype_size_for_array_access(struct datatype *datatype);
+
 size_t datatype_element_size(struct datatype *datatype);
 size_t datatype_size_no_ptr(struct datatype *datatype);
+
+off_t datatype_offset(struct compile_process* compiler, struct datatype* datatype, struct node* member_node);
 
 /**
  * Gets the given return datatype for the provided node.

@@ -212,9 +212,9 @@ void make_struct_node(const char *struct_name, struct node *body_node)
     node_create(&(struct node){NODE_TYPE_STRUCT, .flags = flags, ._struct.name = struct_name, ._struct.body_n = body_node});
 }
 
-void make_unary_node(const char *unary_op, struct node *operand_node)
+void make_unary_node(const char *unary_op, struct node *operand_node, int flags)
 {
-    node_create(&(struct node){NODE_TYPE_UNARY, .unary.op = unary_op, .unary.operand = operand_node});
+    node_create(&(struct node){NODE_TYPE_UNARY, .unary.op = unary_op, .unary.operand = operand_node, .unary.flags=flags});
 }
 
 void make_cast_node(struct datatype* dtype, struct node* operand_node)
@@ -263,6 +263,11 @@ bool node_is_possibly_constant(struct node *node)
 
 bool node_is_constant(struct resolver_process *process, struct node *node)
 {
+    if (!node)
+    {
+        return false;
+    }
+    
     if (!node_is_possibly_constant(node))
     {
         return false;
@@ -557,6 +562,11 @@ struct node *variable_node_or_list(struct node *node)
 
 struct node *variable_node(struct node *node)
 {
+    if (!node)
+    {
+        return NULL;
+    }
+
     struct node *var_node = NULL;
     if (node->type == NODE_TYPE_VARIABLE)
     {
@@ -608,6 +618,8 @@ bool is_node_assignment(struct node *node)
            S_EQ(node->exp.op, "+=") ||
            S_EQ(node->exp.op, "-=") ||
            S_EQ(node->exp.op, "*=") ||
-           S_EQ(node->exp.op, "/=");
+           S_EQ(node->exp.op, "/=") ||
+           S_EQ(node->exp.op, ">>=") ||
+           S_EQ(node->exp.op, "<<=");
 }
 
